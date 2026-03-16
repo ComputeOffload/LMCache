@@ -1281,6 +1281,7 @@ def test_dax_backend_close_rejects_new_ops_after_shutdown(
 def test_dax_backend_async_close_waits_for_active_put(
     memory_allocator,
     loop_in_thread,
+    monkeypatch,
 ) -> None:
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dax.bin")
@@ -1312,77 +1313,49 @@ def test_dax_backend_async_close_waits_for_active_put(
             dst_device="cpu",
         )
 
+        write_started = threading.Event()
+        allow_write = threading.Event()
         close_returned = threading.Event()
-        key = CacheEngineKey("test_model", 1, 0, 411, torch.bfloat16)
+        original_do_write = DaxBackend._do_write
 
+        def _blocking_do_write(self, offset, memory_obj, size) -> None:
+            write_started.set()
+            assert allow_write.wait(timeout=2)
+            original_do_write(self, offset, memory_obj, size)
+
+        monkeypatch.setattr(DaxBackend, "_do_write", _blocking_do_write)
+
+        # Start the event loop so the async_put path is exercised.
+        loop_thread = threading.Thread(target=loop_in_thread.run_forever, daemon=True)
+        loop_thread.start()
         try:
-            assert backend._begin_put_task(key)
+            alloc = AdHocMemoryAllocator(device="cpu")
+            key = CacheEngineKey("test_model", 1, 0, 411, torch.bfloat16)
+            obj = alloc.allocate(
+                [torch.Size([2, 16, 8])],
+                [torch.bfloat16],
+                fmt=MemoryFormat.KV_T2D,
+            )
+            assert obj is not None
+
+            futs = backend.batched_submit_put_task([key], [obj])
+            assert futs is not None
+
+            assert write_started.wait(timeout=2)
             closer = threading.Thread(
                 target=lambda: (backend.close(), close_returned.set())
             )
             closer.start()
             time.sleep(0.05)
             assert not close_returned.is_set()
-            backend._finish_put_task(key)
+
+            allow_write.set()
             closer.join(timeout=2)
 
             assert not closer.is_alive()
             assert close_returned.is_set()
+            obj.ref_count_down()
         finally:
+            loop_in_thread.call_soon_threadsafe(loop_in_thread.stop)
+            loop_thread.join(timeout=2)
             backend.close()
-
-
-def test_dax_backend_async_close_waits_for_put_completion(
-    memory_allocator,
-    loop_in_thread,
-) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(16 * 1024 * 1024)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=True,
-            max_local_cpu_size=0.1,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.arena_size_gb": 16 / 1024,
-                "dax.async_put": True,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        local_cpu = LocalCPUBackend(
-            config=config,
-            metadata=metadata,
-            dst_device="cpu",
-            memory_allocator=memory_allocator,
-        )
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=local_cpu,
-            loop=loop_in_thread,
-            dst_device="cpu",
-        )
-
-        gate = Future()
-
-        def _finish_future() -> None:
-            time.sleep(0.05)
-            gate.set_result(None)
-
-        releaser = threading.Thread(target=_finish_future, daemon=True)
-
-        try:
-            with backend._state_lock:
-                backend._async_futures.add(gate)
-            releaser.start()
-            start = time.monotonic()
-            backend.close()
-            elapsed = time.monotonic() - start
-            assert gate.done()
-            assert elapsed >= 0.04
-        finally:
-            backend.close()
-            releaser.join(timeout=1)

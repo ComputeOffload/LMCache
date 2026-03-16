@@ -47,7 +47,6 @@ class _Entry:
     """In-memory index entry for a stored chunk."""
 
     offset: int
-    size: int
     meta: DiskCacheMetadata
     slot_id: int
     generation: int
@@ -72,106 +71,6 @@ class _SlotState:
     committed: bool = False
     borrow_count: int = 0
     pending_free: bool = False
-
-
-@dataclass(frozen=True)
-class _ArenaHandle:
-    """Borrow token used while reading from a DAX slot."""
-
-    slot_id: int
-    generation: int
-
-
-class _ArenaState:
-    """Owns the DAX mmap and releases it when the backend closes."""
-
-    def __init__(
-        self,
-        fd: int,
-        mmap_obj: mmap.mmap,
-        base_ptr: int,
-        arena_view: memoryview,
-        arena_tensor: torch.Tensor,
-    ) -> None:
-        self._fd: Optional[int] = fd
-        self._mmap_obj: Optional[mmap.mmap] = mmap_obj
-        self._base_ptr = base_ptr
-        self._arena_view: Optional[memoryview] = arena_view
-        self._arena_tensor: Optional[torch.Tensor] = arena_tensor
-        self._released = False
-        self._lock = threading.Lock()
-
-    def release_owner(self) -> None:
-        with self._lock:
-            if self._released:
-                return
-            fd = self._fd
-            mmap_obj = self._mmap_obj
-            arena_view = self._arena_view
-            self._fd = None
-            self._mmap_obj = None
-            self._arena_view = None
-            self._arena_tensor = None
-            self._base_ptr = 0
-            self._released = True
-
-        resources = (fd, mmap_obj, arena_view)
-        if resources is not None:
-            self._cleanup_resources(*resources)
-
-    def snapshot(self) -> tuple[
-        Optional[int],
-        Optional[mmap.mmap],
-        int,
-        Optional[memoryview],
-        Optional[torch.Tensor],
-    ]:
-        with self._lock:
-            return (
-                self._fd,
-                self._mmap_obj,
-                self._base_ptr,
-                self._arena_view,
-                self._arena_tensor,
-            )
-
-    @staticmethod
-    def _cleanup_resources(
-        fd: Optional[int],
-        mmap_obj: Optional[mmap.mmap],
-        arena_view: Optional[memoryview],
-    ) -> None:
-        if arena_view is not None:
-            try:
-                arena_view.release()
-            except Exception as e:
-                logger.warning("Failed to release DAX memoryview: %s", e)
-
-        if mmap_obj is not None:
-            try:
-                mmap_obj.close()
-            except Exception as e:
-                logger.warning("Failed to close DAX mmap: %s", e)
-
-        if fd is not None:
-            try:
-                os.close(fd)
-            except Exception as e:
-                logger.warning("Failed to close DAX fd: %s", e)
-
-
-@dataclass
-class _BackendOpToken:
-    """Tracks an in-flight backend operation that must quiesce during close."""
-
-    backend: "DaxBackend"
-    released: bool = False
-
-    def release(self) -> None:
-        if self.released:
-            return
-        self.released = True
-        self.backend._finish_backend_op()
 
 
 class DaxBackend(StoragePluginInterface):
@@ -235,7 +134,6 @@ class DaxBackend(StoragePluginInterface):
         self._base_ptr: int = 0
         self._arena_view: Optional[memoryview] = None
         self._arena_tensor: Optional[torch.Tensor] = None
-        self._arena_state: Optional[_ArenaState] = None
         self._open_arena()
         try:
             assert self.local_cpu_backend is not None
@@ -253,13 +151,9 @@ class DaxBackend(StoragePluginInterface):
             self._inflight: dict[CacheEngineKey, _Inflight] = {}
             self._lru: "OrderedDict[CacheEngineKey, None]" = OrderedDict()
             self._slot_states: dict[int, _SlotState] = {}
-            self._slot_generations: dict[int, int] = {}
 
             self._next_slot = 0
             self._free_slots: list[int] = []
-            self._reserved_slots: set[int] = set()
-            self._put_tasks: set[CacheEngineKey] = set()
-            self._async_futures: set[Future] = set()
             self._active_ops = 0
             self._active_puts = 0
             self._closing = False
@@ -273,59 +167,47 @@ class DaxBackend(StoragePluginInterface):
                 self._max_slots,
             )
         except Exception:
-            self._cleanup_arena()
+            fd, mmap_obj, arena_view = self._fd, self._mmap_obj, self._arena_view
+            self._fd = None
+            self._mmap_obj = None
+            self._base_ptr = 0
+            self._arena_view = None
+            self._arena_tensor = None
+            self._release_arena_resources(fd, mmap_obj, arena_view)
             raise
 
     def __str__(self) -> str:
         return "DaxBackend"
 
-    def _cleanup_arena(self) -> None:
-        arena_state = self._arena_state
-        self._detach_backend_arena()
-        self._arena_state = None
-        if arena_state is not None:
-            arena_state.release_owner()
+    @staticmethod
+    def _release_arena_resources(
+        fd: Optional[int],
+        mmap_obj: Optional[mmap.mmap],
+        arena_view: Optional[memoryview],
+    ) -> None:
+        if arena_view is not None:
+            try:
+                arena_view.release()
+            except Exception as e:
+                logger.warning("Failed to release DAX memoryview: %s", e)
 
-    def _bind_backend_arena(self, arena_state: _ArenaState) -> None:
-        (
-            self._fd,
-            self._mmap_obj,
-            self._base_ptr,
-            self._arena_view,
-            self._arena_tensor,
-        ) = arena_state.snapshot()
+        if mmap_obj is not None:
+            try:
+                mmap_obj.close()
+            except Exception as e:
+                logger.warning("Failed to close DAX mmap: %s", e)
 
-    def _detach_backend_arena(self) -> None:
-        self._fd = None
-        self._mmap_obj = None
-        self._base_ptr = 0
-        self._arena_view = None
-        self._arena_tensor = None
-
-    def _next_generation_locked(self, slot_id: int) -> int:
-        generation = self._slot_generations.get(slot_id, 0) + 1
-        self._slot_generations[slot_id] = generation
-        return generation
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception as e:
+                logger.warning("Failed to close DAX fd: %s", e)
 
     def _reserve_slot_state_locked(self, slot_id: int) -> int:
-        generation = self._next_generation_locked(slot_id)
-        self._slot_states[slot_id] = _SlotState(generation=generation)
-        return generation
-
-    def _begin_backend_op(self) -> Optional[_BackendOpToken]:
-        with self._state_lock:
-            if self._closing:
-                return None
-            self._active_ops += 1
-        return _BackendOpToken(self)
-
-    def _finish_backend_op(self) -> None:
-        with self._state_lock:
-            if self._active_ops > 0:
-                self._active_ops -= 1
-            else:
-                logger.warning("DaxBackend active op count underflow")
-            self._state_condition.notify_all()
+        existing = self._slot_states.get(slot_id)
+        new_gen = (existing.generation if existing is not None else 0) + 1
+        self._slot_states[slot_id] = _SlotState(generation=new_gen)
+        return new_gen
 
     def _mark_slot_committed_locked(self, slot_id: int, generation: int) -> None:
         state = self._slot_states.get(slot_id)
@@ -340,17 +222,10 @@ class DaxBackend(StoragePluginInterface):
             return
         state.committed = False
         if state.borrow_count == 0:
-            self._slot_states.pop(slot_id, None)
+            state.pending_free = False
             self._free_slot_locked(slot_id)
         else:
             state.pending_free = True
-
-    def _acquire_borrow_handle_locked(self, entry: _Entry) -> Optional[_ArenaHandle]:
-        state = self._slot_states.get(entry.slot_id)
-        if state is None or state.generation != entry.generation or not state.committed:
-            return None
-        state.borrow_count += 1
-        return _ArenaHandle(slot_id=entry.slot_id, generation=entry.generation)
 
     def _finalize_inflight_locked(
         self,
@@ -363,65 +238,15 @@ class DaxBackend(StoragePluginInterface):
         if inflight.canceled or write_failed:
             self._schedule_slot_reclaim_locked(inflight.slot_id, inflight.generation)
             return False
-        self._reserved_slots.discard(inflight.slot_id)
         self._mark_slot_committed_locked(inflight.slot_id, inflight.generation)
         self._index[key] = _Entry(
             offset=inflight.offset,
-            size=inflight.meta.size,
             meta=inflight.meta,
             slot_id=inflight.slot_id,
             generation=inflight.generation,
         )
         self._touch_locked(key)
         return True
-
-    def _release_arena_handle_locked(self, handle: _ArenaHandle) -> None:
-        state = self._slot_states.get(handle.slot_id)
-        if state is None or state.generation != handle.generation:
-            return
-
-        if state.borrow_count > 0:
-            state.borrow_count -= 1
-        if state.pending_free and state.borrow_count == 0:
-            self._slot_states.pop(handle.slot_id, None)
-            self._free_slot_locked(handle.slot_id)
-
-    def _touch_if_current_locked(
-        self,
-        key: CacheEngineKey,
-        slot_id: int,
-        generation: int,
-    ) -> None:
-        current = self._index.get(key)
-        if (
-            current is not None
-            and current.slot_id == slot_id
-            and current.generation == generation
-        ):
-            self._touch_locked(key)
-
-    def _discard_async_future(self, future: Future) -> None:
-        with self._state_lock:
-            self._async_futures.discard(future)
-
-    def _begin_put_task(self, key: CacheEngineKey) -> bool:
-        with self._state_lock:
-            if self._closing:
-                raise RuntimeError("DaxBackend is closing")
-            if key in self._put_tasks:
-                return False
-            self._put_tasks.add(key)
-            self._active_puts += 1
-            return True
-
-    def _finish_put_task(self, key: CacheEngineKey) -> None:
-        with self._state_lock:
-            self._put_tasks.discard(key)
-            if self._active_puts > 0:
-                self._active_puts -= 1
-            else:
-                logger.warning("DaxBackend active put count underflow for key %s", key)
-            self._state_condition.notify_all()
 
     def _invoke_on_complete_callback(
         self,
@@ -474,16 +299,13 @@ class DaxBackend(StoragePluginInterface):
 
                 arr = np.frombuffer(arena_view, dtype=np.uint8)
                 arena_tensor = torch.from_numpy(arr)
-            self._arena_state = _ArenaState(
-                fd=fd,
-                mmap_obj=mmap_obj,
-                base_ptr=base_ptr,
-                arena_view=arena_view,
-                arena_tensor=arena_tensor,
-            )
-            self._bind_backend_arena(self._arena_state)
+            self._fd = fd
+            self._mmap_obj = mmap_obj
+            self._base_ptr = base_ptr
+            self._arena_view = arena_view
+            self._arena_tensor = arena_tensor
         except Exception as e:
-            _ArenaState._cleanup_resources(fd, mmap_obj, arena_view)
+            DaxBackend._release_arena_resources(fd, mmap_obj, arena_view)
             if isinstance(e, RuntimeError):
                 raise
             raise RuntimeError(
@@ -494,19 +316,16 @@ class DaxBackend(StoragePluginInterface):
     def _allocate_slot_locked(self) -> int:
         if self._free_slots:
             slot = self._free_slots.pop()
-            self._reserved_slots.add(slot)
             return slot * self.slot_bytes
         if self._next_slot < self._max_slots:
             slot = self._next_slot
             self._next_slot += 1
-            self._reserved_slots.add(slot)
             return slot * self.slot_bytes
         raise RuntimeError("No free slots available; eviction required")
 
     def _free_slot_locked(self, slot_id: int) -> None:
         if slot_id < 0:
             return
-        self._reserved_slots.discard(slot_id)
         if slot_id not in self._free_slots:
             self._free_slots.append(slot_id)
 
@@ -559,7 +378,7 @@ class DaxBackend(StoragePluginInterface):
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self._state_lock:
-            return key in self._put_tasks
+            return key in self._inflight
 
     def pin(self, key: CacheEngineKey) -> bool:
         with self._state_lock:
@@ -606,11 +425,7 @@ class DaxBackend(StoragePluginInterface):
         futures: List[Future] = []
 
         for key, obj in zip(keys, objs, strict=True):
-            task_started = self._begin_put_task(key)
-            if not task_started:
-                continue
-
-            should_finish_task = True
+            should_finish_put = False
             try:
                 # Reject multi-tensor objects explicitly
                 num_shapes = len(obj.get_shapes())
@@ -631,6 +446,8 @@ class DaxBackend(StoragePluginInterface):
                 fmt = obj_metadata.fmt
 
                 with self._state_lock:
+                    if self._closing:
+                        raise RuntimeError("DaxBackend is closing")
                     if key in self._index or key in self._inflight:
                         continue
 
@@ -670,6 +487,8 @@ class DaxBackend(StoragePluginInterface):
                         generation=generation,
                         canceled=False,
                     )
+                    self._active_puts += 1
+                    should_finish_put = True
 
                 if self.async_put and self.loop is not None and self.loop.is_running():
                     obj.ref_count_up()
@@ -689,11 +508,8 @@ class DaxBackend(StoragePluginInterface):
                             self._finalize_inflight_locked(key, write_failed=True)
                         obj.ref_count_down()
                         raise
-                    with self._state_lock:
-                        self._async_futures.add(fut)
-                    fut.add_done_callback(self._discard_async_future)
                     futures.append(fut)
-                    should_finish_task = False
+                    should_finish_put = False
                     continue
 
                 try:
@@ -714,8 +530,15 @@ class DaxBackend(StoragePluginInterface):
                 if should_invoke_callback:
                     self._invoke_on_complete_callback(key, on_complete_callback)
             finally:
-                if task_started and should_finish_task:
-                    self._finish_put_task(key)
+                if should_finish_put:
+                    with self._state_lock:
+                        if self._active_puts > 0:
+                            self._active_puts -= 1
+                        else:
+                            logger.warning(
+                                "DaxBackend active put count underflow for key %s", key
+                            )
+                        self._state_condition.notify_all()
 
         return futures or None
 
@@ -734,6 +557,7 @@ class DaxBackend(StoragePluginInterface):
                 await asyncio.to_thread(self._do_write, offset, memory_obj, size)
             except Exception as e:
                 write_error = e
+                logger.warning("Async DAX write failed for key %s: %s", key, e)
             finally:
                 with self._state_lock:
                     should_invoke_callback = self._finalize_inflight_locked(
@@ -750,77 +574,71 @@ class DaxBackend(StoragePluginInterface):
                 self._invoke_on_complete_callback(key, on_complete_callback)
         finally:
             memory_obj.ref_count_down()
-            self._finish_put_task(key)
+            with self._state_lock:
+                if self._active_puts > 0:
+                    self._active_puts -= 1
+                else:
+                    logger.warning(
+                        "DaxBackend active put count underflow for key %s", key
+                    )
+                self._state_condition.notify_all()
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Return the memory object for a key, or ``None`` if unavailable."""
-        op_token = self._begin_backend_op()
-        if op_token is None:
-            return None
+        with self._state_lock:
+            if self._closing:
+                return None
+            entry = self._index.get(key)
+            if entry is None:
+                return None
+            meta = entry.meta
+            if meta.shape is None or meta.dtype is None:
+                return None
+            state = self._slot_states.get(entry.slot_id)
+            if state is None or state.generation != entry.generation or not state.committed:
+                return None
+            state.borrow_count += 1
+            self._active_ops += 1
+            offset, size = entry.offset, int(meta.size)
+            shape, dtype, fmt = meta.shape, meta.dtype, meta.fmt
+            cached_positions = meta.cached_positions
+            slot_id, generation = entry.slot_id, entry.generation
 
-        borrow_handle: Optional[_ArenaHandle] = None
-        touch_slot_id: Optional[int] = None
-        touch_generation: Optional[int] = None
+        assert self.local_cpu_backend is not None
+        memory_obj: Optional[MemoryObj] = None
+        read_ok = False
         try:
-            with self._state_lock:
-                if self._closing:
-                    return None
-                entry = self._index.get(key)
-                if entry is None:
-                    return None
-
-                meta = entry.meta
-                if meta.shape is None or meta.dtype is None:
-                    return None
-
-                borrow_handle = self._acquire_borrow_handle_locked(entry)
-                if borrow_handle is None:
-                    return None
-                touch_slot_id = entry.slot_id
-                touch_generation = entry.generation
-                shape = meta.shape
-                dtype = meta.dtype
-                fmt = meta.fmt
-                cached_positions = meta.cached_positions
-                offset = entry.offset
-                size = int(meta.size)
-
-            assert self.local_cpu_backend is not None
-            should_touch = False
-            memory_obj: Optional[MemoryObj] = None
-            try:
-                memory_obj = self.local_cpu_backend.allocate(
-                    shape,
-                    dtype,
-                    fmt,
-                )
-                if memory_obj is None:
-                    return None
-                self._do_read(offset, memory_obj, size)
-                memory_obj.metadata.cached_positions = cached_positions
-                should_touch = True
-            except Exception:
-                if memory_obj is not None:
-                    memory_obj.ref_count_down()
-                raise
-            finally:
-                if borrow_handle is not None:
-                    with self._state_lock:
-                        if (
-                            should_touch
-                            and touch_slot_id is not None
-                            and touch_generation is not None
-                        ):
-                            self._touch_if_current_locked(
-                                key,
-                                touch_slot_id,
-                                touch_generation,
-                            )
-                        self._release_arena_handle_locked(borrow_handle)
-            assert memory_obj is not None
+            memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+            if memory_obj is None:
+                return None
+            self._do_read(offset, memory_obj, size)
+            memory_obj.metadata.cached_positions = cached_positions
+            read_ok = True
             return memory_obj
+        except Exception:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+            raise
         finally:
-            op_token.release()
+            with self._state_lock:
+                if self._active_ops > 0:
+                    self._active_ops -= 1
+                state = self._slot_states.get(slot_id)
+                if state is not None and state.generation == generation:
+                    if state.borrow_count > 0:
+                        state.borrow_count -= 1
+                    if read_ok:
+                        current = self._index.get(key)
+                        if (
+                            current is not None
+                            and current.slot_id == slot_id
+                            and current.generation == generation
+                        ):
+                            self._touch_locked(key)
+                    if state.pending_free and state.borrow_count == 0:
+                        state.pending_free = False
+                        self._free_slot_locked(slot_id)
+                self._state_condition.notify_all()
 
     async def batched_async_contains(
         self,
@@ -895,26 +713,19 @@ class DaxBackend(StoragePluginInterface):
             if self._closed:
                 return
             self._closed = True
-            futures = list(self._async_futures)
             self._index.clear()
             self._inflight.clear()
             self._lru.clear()
             self._pinned.clear()
             self._slot_states.clear()
-            self._slot_generations.clear()
-            self._reserved_slots.clear()
             self._free_slots.clear()
-            self._put_tasks.clear()
-            self._async_futures.clear()
-            arena_state = self._arena_state
-            self._arena_state = None
-            self._detach_backend_arena()
+            fd = self._fd
+            mmap_obj = self._mmap_obj
+            arena_view = self._arena_view
+            self._fd = None
+            self._mmap_obj = None
+            self._base_ptr = 0
+            self._arena_view = None
+            self._arena_tensor = None
 
-        for future in futures:
-            try:
-                future.result()
-            except Exception as e:
-                logger.warning("In-flight DAX async write failed during close: %s", e)
-
-        if arena_state is not None:
-            arena_state.release_owner()
+        self._release_arena_resources(fd, mmap_obj, arena_view)
