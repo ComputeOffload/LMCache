@@ -16,14 +16,11 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.event_manager import EventManager
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.memory_management import AdHocMemoryAllocator, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.plugins.dax_backend import DaxBackend
-from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
 @pytest.fixture
@@ -33,11 +30,6 @@ def loop_in_thread() -> asyncio.AbstractEventLoop:
         yield loop
     finally:
         loop.close()
-
-
-@pytest.fixture
-def disable_direct_gpu_ready(monkeypatch) -> None:
-    monkeypatch.setattr(DaxBackend, "_ensure_direct_gpu_ready", lambda self: None)
 
 
 def _create_metadata(
@@ -99,17 +91,7 @@ def _create_config(
     return config
 
 
-def _assert_no_dax_private_attrs(memory_obj) -> None:
-    for attr in (
-        "_lmcache_dax_handle",
-        "_lmcache_dax_released",
-        "_lmcache_dax_backed",
-        "_lmcache_dax_offset",
-    ):
-        assert not hasattr(memory_obj, attr)
-
-
-def test_dax_backend_tiered_roundtrip(memory_allocator, loop_in_thread):
+def test_dax_backend_roundtrip(memory_allocator, loop_in_thread):
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dax.bin")
         with open(dev_path, "wb") as fout:
@@ -121,7 +103,6 @@ def test_dax_backend_tiered_roundtrip(memory_allocator, loop_in_thread):
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
             },
         )
@@ -178,7 +159,6 @@ def test_dax_backend_rejects_tp_gt_1(loop_in_thread):
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 4 / 1024,
             },
         )
@@ -194,7 +174,7 @@ def test_dax_backend_rejects_tp_gt_1(loop_in_thread):
             )
 
 
-def test_dax_backend_primary_requires_cuda_dst_device() -> None:
+def test_dax_backend_requires_local_cpu_backend() -> None:
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dax.bin")
         with open(dev_path, "wb") as fout:
@@ -202,17 +182,16 @@ def test_dax_backend_primary_requires_cuda_dst_device() -> None:
 
         config = _create_config(
             chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "primary",
                 "dax.arena_size_gb": 4096 / 1024**3,
             },
         )
         metadata = _create_metadata(chunk_size=16)
 
-        with pytest.raises(ValueError, match="requires a CUDA dst_device"):
+        with pytest.raises(ValueError, match="requires local_cpu_backend"):
             DaxBackend(
                 config=config,
                 metadata=metadata,
@@ -222,10 +201,7 @@ def test_dax_backend_primary_requires_cuda_dst_device() -> None:
             )
 
 
-@pytest.mark.parametrize("mode", ["primary", "tiered"])
-def test_dax_backend_rejects_multi_group_metadata_at_init(
-    mode: str,
-) -> None:
+def test_dax_backend_rejects_multi_group_metadata_at_init() -> None:
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dax.bin")
         with open(dev_path, "wb") as fout:
@@ -233,11 +209,10 @@ def test_dax_backend_rejects_multi_group_metadata_at_init(
 
         config = _create_config(
             chunk_size=16,
-            local_cpu=(mode == "tiered"),
-            max_local_cpu_size=0.1 if mode == "tiered" else 0.0,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": mode,
                 "dax.arena_size_gb": 8 / 1024,
             },
         )
@@ -249,394 +224,8 @@ def test_dax_backend_rejects_multi_group_metadata_at_init(
                 metadata=metadata,
                 local_cpu_backend=None,
                 loop=None,
-                dst_device="cuda:0" if mode == "primary" else "cpu",
+                dst_device="cpu",
             )
-
-
-def test_storage_manager_can_use_dax_plugin_as_allocator(
-    disable_direct_gpu_ready,
-    monkeypatch,
-) -> None:
-    del disable_direct_gpu_ready
-    monkeypatch.setattr(
-        "lmcache.v1.storage_backend.storage_manager.is_cuda_worker",
-        lambda metadata: True,
-    )
-    monkeypatch.setattr(
-        "lmcache.v1.storage_backend.storage_manager.torch.cuda.Stream",
-        lambda: object(),
-    )
-    monkeypatch.setattr(
-        "lmcache.v1.storage_backend.is_cuda_worker",
-        lambda metadata: True,
-    )
-    monkeypatch.setattr(
-        "lmcache.v1.storage_backend.torch.cuda.current_device",
-        lambda: 0,
-    )
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(8 * 1024 * 1024)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            storage_plugins=["dax"],
-            extra_config={
-                "storage_plugin.dax.module_path": (
-                    "lmcache.v1.storage_backend.plugins.dax_backend"
-                ),
-                "storage_plugin.dax.class_name": "DaxBackend",
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 8 / 1024,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16, role="worker")
-        event_manager = EventManager()
-
-        manager = StorageManager(
-            config=config,
-            metadata=metadata,
-            event_manager=event_manager,
-        )
-        try:
-            assert manager.allocator_backend is not None
-            assert manager.allocator_backend.__class__.__name__ == "DaxBackend"
-            assert isinstance(manager.allocator_backend, AllocatorBackendInterface)
-            assert manager.memcheck()
-            assert manager.allocator_backend.get_memory_allocator().memcheck()
-        finally:
-            manager.close()
-
-
-def test_dax_backend_primary_view_survives_remove_until_release(
-    disable_direct_gpu_ready,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        try:
-            key1 = CacheEngineKey("test_model", 1, 0, 601, torch.bfloat16)
-            key2 = CacheEngineKey("test_model", 1, 0, 602, torch.bfloat16)
-            obj1 = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert obj1 is not None
-            assert obj1.tensor is not None
-            obj1.tensor.fill_(1)
-            backend.batched_submit_put_task([key1], [obj1])
-            obj1.ref_count_down()
-
-            borrowed = backend.get_blocking(key1)
-            assert borrowed is not None
-            assert borrowed.tensor is not None
-            assert torch.all(borrowed.tensor == 1)
-
-            assert backend.remove(key1)
-
-            obj2 = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert obj2 is not None
-            assert obj2.tensor is not None
-            obj2.tensor.fill_(9)
-            backend.batched_submit_put_task([key2], [obj2])
-            obj2.ref_count_down()
-
-            assert torch.all(borrowed.tensor == 1)
-
-            borrowed.ref_count_down()
-            assert backend.remove(key2)
-
-            recycled = backend.batched_allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                batch_size=2,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert recycled is not None
-            for memory_obj in recycled:
-                memory_obj.ref_count_down()
-        finally:
-            backend.close()
-
-
-def test_dax_backend_primary_allocation_release_reuses_capacity(
-    disable_direct_gpu_ready,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        try:
-            for _ in range(6):
-                obj = backend.allocate(
-                    torch.Size([2, 16, 8]),
-                    torch.bfloat16,
-                    fmt=MemoryFormat.KV_T2D,
-                    eviction=False,
-                )
-                assert obj is not None
-                obj.ref_count_down()
-
-            objs = backend.batched_allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                batch_size=2,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert objs is not None
-            for obj in objs:
-                obj.ref_count_down()
-        finally:
-            backend.close()
-
-
-def test_dax_backend_primary_keeps_memory_obj_tracking_internal(
-    disable_direct_gpu_ready,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        try:
-            key = CacheEngineKey("test_model", 1, 0, 603, torch.bfloat16)
-            obj = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert obj is not None
-            assert obj.tensor is not None
-            obj.tensor.fill_(2)
-            _assert_no_dax_private_attrs(obj)
-
-            backend.batched_submit_put_task([key], [obj])
-
-            borrowed = backend.get_blocking(key)
-            assert borrowed is not None
-            _assert_no_dax_private_attrs(borrowed)
-
-            borrowed.ref_count_down()
-            obj.ref_count_down()
-        finally:
-            backend.close()
-
-
-def test_dax_backend_primary_direct_commit_put_and_release_do_not_deadlock(
-    disable_direct_gpu_ready,
-    monkeypatch,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        lookup_entered = threading.Event()
-        allow_lookup = threading.Event()
-        errors: dict[str, BaseException] = {}
-        original = backend._get_memory_obj_state_locked
-
-        def _blocking_get_state(memory_obj):
-            lookup_entered.set()
-            assert allow_lookup.wait(timeout=1)
-            return original(memory_obj)
-
-        monkeypatch.setattr(backend, "_get_memory_obj_state_locked", _blocking_get_state)
-
-        try:
-            key = CacheEngineKey("test_model", 1, 0, 604, torch.bfloat16)
-            obj = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert obj is not None
-            assert obj.tensor is not None
-            obj.tensor.fill_(11)
-
-            def _put() -> None:
-                try:
-                    backend.batched_submit_put_task([key], [obj])
-                except BaseException as e:
-                    errors["put"] = e
-
-            def _release() -> None:
-                try:
-                    obj.ref_count_down()
-                except BaseException as e:
-                    errors["release"] = e
-
-            put_thread = threading.Thread(target=_put)
-            release_thread = threading.Thread(target=_release)
-
-            put_thread.start()
-            assert lookup_entered.wait(timeout=1)
-
-            release_thread.start()
-            allow_lookup.set()
-
-            put_thread.join(timeout=1)
-            release_thread.join(timeout=1)
-
-            assert not put_thread.is_alive()
-            assert not release_thread.is_alive()
-            assert "put" not in errors
-            assert "release" not in errors
-
-            out = backend.get_blocking(key)
-            assert out is not None
-            assert out.tensor is not None
-            assert torch.all(out.tensor == 11)
-            out.ref_count_down()
-        finally:
-            backend.close()
-
-
-def test_dax_backend_primary_rejects_multi_tensor_allocate(
-    disable_direct_gpu_ready,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        try:
-            rejected = backend.allocate(
-                [torch.Size([2, 8, 8]), torch.Size([2, 8, 8])],
-                [torch.bfloat16, torch.bfloat16],
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert rejected is None
-
-            valid = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert valid is not None
-            valid.ref_count_down()
-        finally:
-            backend.close()
 
 
 def test_dax_backend_failed_init_does_not_leak_fds() -> None:
@@ -654,7 +243,6 @@ def test_dax_backend_failed_init_does_not_leak_fds() -> None:
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
             },
         )
@@ -696,7 +284,6 @@ def test_dax_backend_oversized_put_skips_without_indexing_or_leaking_slots(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 32 / (1024 * 1024),  # one slot
             },
         )
@@ -731,14 +318,32 @@ def test_dax_backend_oversized_put_skips_without_indexing_or_leaking_slots(
             assert backend.get_blocking(oversized_key) is None
             oversized.ref_count_down()
 
-            reserved = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
+            valid_key = CacheEngineKey("test_model", 1, 0, 705, torch.bfloat16)
+            valid = alloc.allocate(
+                [torch.Size([2, 256, 8])],
+                [torch.bfloat16],
                 fmt=MemoryFormat.KV_T2D,
-                eviction=False,
+            )
+            assert valid is not None
+            assert valid.tensor is not None
+            valid.tensor.fill_(3)
+            backend.batched_submit_put_task([valid_key], [valid])
+            valid.ref_count_down()
+
+            out = backend.get_blocking(valid_key)
+            assert out is not None
+            assert out.tensor is not None
+            assert torch.all(out.tensor == 3)
+            out.ref_count_down()
+            assert backend.remove(valid_key)
+
+            direct_key = CacheEngineKey("test_model", 1, 0, 706, torch.bfloat16)
+            reserved = alloc.allocate(
+                [torch.Size([2, 256, 8])],
+                [torch.bfloat16],
+                fmt=MemoryFormat.KV_T2D,
             )
             assert reserved is not None
-            direct_key = CacheEngineKey("test_model", 1, 0, 705, torch.bfloat16)
 
             with monkeypatch.context() as local_patch:
                 local_patch.setattr(
@@ -749,100 +354,19 @@ def test_dax_backend_oversized_put_skips_without_indexing_or_leaking_slots(
                 backend.batched_submit_put_task([direct_key], [reserved])
 
             assert not backend.contains(direct_key)
-            reclaimed = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert reclaimed is None
             reserved.ref_count_down()
-            recycled = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert recycled is not None
-            recycled.ref_count_down()
-        finally:
-            backend.close()
 
-
-def test_dax_backend_duplicate_direct_commit_reject_keeps_reserved_slot_until_release(
-    memory_allocator,
-    loop_in_thread,
-) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(1024 * 1024)
-
-        config = _create_config(
-            chunk_size=256,
-            local_cpu=True,
-            max_local_cpu_size=0.1,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "tiered",
-                "dax.arena_size_gb": 64 / (1024 * 1024),  # two slots
-            },
-        )
-        metadata = _create_metadata(chunk_size=256)
-        local_cpu = LocalCPUBackend(
-            config=config,
-            metadata=metadata,
-            dst_device="cpu",
-            memory_allocator=memory_allocator,
-        )
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=local_cpu,
-            loop=loop_in_thread,
-            dst_device="cpu",
-        )
-
-        try:
-            alloc = AdHocMemoryAllocator(device="cpu")
-            committed_key = CacheEngineKey("test_model", 1, 0, 800, torch.bfloat16)
-            initial = alloc.allocate(
+            recycled_key = CacheEngineKey("test_model", 1, 0, 707, torch.bfloat16)
+            recycled = alloc.allocate(
                 [torch.Size([2, 256, 8])],
                 [torch.bfloat16],
                 fmt=MemoryFormat.KV_T2D,
             )
-            assert initial is not None
-            backend.batched_submit_put_task([committed_key], [initial])
-            initial.ref_count_down()
-            assert backend.contains(committed_key)
-
-            reserved = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert reserved is not None
-
-            backend.batched_submit_put_task([committed_key], [reserved])
-            assert backend.contains(committed_key)
-
-            reclaimed = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert reclaimed is None
-
-            reserved.ref_count_down()
-            recycled = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
             assert recycled is not None
+            backend.batched_submit_put_task([recycled_key], [recycled])
+            recycled_out = backend.get_blocking(recycled_key)
+            assert recycled_out is not None
+            recycled_out.ref_count_down()
             recycled.ref_count_down()
         finally:
             backend.close()
@@ -863,7 +387,6 @@ def test_dax_backend_put_rejects_mismatched_key_and_obj_lengths(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 64 / (1024 * 1024),
             },
         )
@@ -919,7 +442,6 @@ def test_dax_backend_multi_tensor_put_skips_without_indexing_or_leaking_slots(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 32 / (1024 * 1024),  # one slot
             },
         )
@@ -953,19 +475,23 @@ def test_dax_backend_multi_tensor_put_skips_without_indexing_or_leaking_slots(
             assert backend.get_blocking(multi_key) is None
             multi.ref_count_down()
 
-            reclaimed = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
+            valid_key = CacheEngineKey("test_model", 1, 0, 708, torch.bfloat16)
+            reclaimed = alloc.allocate(
+                [torch.Size([2, 256, 8])],
+                [torch.bfloat16],
                 fmt=MemoryFormat.KV_T2D,
-                eviction=False,
             )
             assert reclaimed is not None
+            backend.batched_submit_put_task([valid_key], [reclaimed])
+            out = backend.get_blocking(valid_key)
+            assert out is not None
+            out.ref_count_down()
             reclaimed.ref_count_down()
         finally:
             backend.close()
 
 
-def test_dax_backend_tiered_get_blocking_releases_lock_during_read(
+def test_dax_backend_get_blocking_releases_lock_during_read(
     memory_allocator,
     loop_in_thread,
     monkeypatch,
@@ -981,7 +507,6 @@ def test_dax_backend_tiered_get_blocking_releases_lock_during_read(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
             },
         )
@@ -1061,7 +586,7 @@ def test_dax_backend_tiered_get_blocking_releases_lock_during_read(
             backend.close()
 
 
-def test_dax_backend_tiered_remove_during_read_defers_slot_reclaim(
+def test_dax_backend_remove_during_read_defers_slot_reclaim(
     memory_allocator,
     loop_in_thread,
     monkeypatch,
@@ -1077,7 +602,6 @@ def test_dax_backend_tiered_remove_during_read_defers_slot_reclaim(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 32 / (1024 * 1024),
             },
         )
@@ -1130,13 +654,16 @@ def test_dax_backend_tiered_remove_during_read_defers_slot_reclaim(
             assert read_started.wait(timeout=1)
 
             assert backend.remove(key)
-            blocked = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
+            blocked_key = CacheEngineKey("test_model", 1, 0, 704, torch.bfloat16)
+            blocked = alloc.allocate(
+                [torch.Size([2, 256, 8])],
+                [torch.bfloat16],
                 fmt=MemoryFormat.KV_T2D,
-                eviction=False,
             )
-            assert blocked is None
+            assert blocked is not None
+            with pytest.raises(RuntimeError, match="No free slots available"):
+                backend.batched_submit_put_task([blocked_key], [blocked])
+            blocked.ref_count_down()
 
             allow_read.set()
             reader.join(timeout=1)
@@ -1148,20 +675,24 @@ def test_dax_backend_tiered_remove_during_read_defers_slot_reclaim(
             assert torch.all(result.tensor == 7)
             result.ref_count_down()
 
-            recycled = backend.allocate(
-                torch.Size([2, 256, 8]),
-                torch.bfloat16,
+            recycled_key = CacheEngineKey("test_model", 1, 0, 705, torch.bfloat16)
+            recycled = alloc.allocate(
+                [torch.Size([2, 256, 8])],
+                [torch.bfloat16],
                 fmt=MemoryFormat.KV_T2D,
-                eviction=False,
             )
             assert recycled is not None
+            backend.batched_submit_put_task([recycled_key], [recycled])
+            recycled_out = backend.get_blocking(recycled_key)
+            assert recycled_out is not None
+            recycled_out.ref_count_down()
             recycled.ref_count_down()
             assert backend.get_blocking(key) is None
         finally:
             backend.close()
 
 
-def test_dax_backend_tiered_get_read_failure_releases_cpu_memory_obj(
+def test_dax_backend_get_read_failure_releases_cpu_memory_obj(
     memory_allocator,
     loop_in_thread,
     monkeypatch,
@@ -1177,7 +708,6 @@ def test_dax_backend_tiered_get_read_failure_releases_cpu_memory_obj(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 32 / (1024 * 1024),
             },
         )
@@ -1245,7 +775,10 @@ def test_dax_backend_tiered_get_read_failure_releases_cpu_memory_obj(
             backend.close()
 
 
-def test_dax_backend_allocator_exhaustion_triggers_eviction(memory_allocator, loop_in_thread):
+def test_dax_backend_allocator_exhaustion_triggers_eviction(
+    memory_allocator,
+    loop_in_thread,
+):
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dax.bin")
         with open(dev_path, "wb") as fout:
@@ -1257,7 +790,6 @@ def test_dax_backend_allocator_exhaustion_triggers_eviction(memory_allocator, lo
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 64 / (1024 * 1024),  # ~2 slots for test kv shape
             },
         )
@@ -1322,7 +854,6 @@ def test_dax_backend_pinned_key_is_not_evicted(memory_allocator, loop_in_thread)
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 64 / (1024 * 1024),
             },
         )
@@ -1399,7 +930,6 @@ def test_dax_backend_remove_inflight_reclaims_slot(memory_allocator, loop_in_thr
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 32 / (1024 * 1024),  # one slot
             },
         )
@@ -1461,7 +991,6 @@ def test_dax_backend_multithread_put_get_smoke(memory_allocator, loop_in_thread)
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
             },
         )
@@ -1525,7 +1054,6 @@ def test_dax_backend_sync_close_waits_for_active_put(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
             },
         )
@@ -1602,7 +1130,7 @@ def test_dax_backend_sync_close_waits_for_active_put(
             backend.close()
 
 
-def test_dax_backend_sync_close_waits_for_active_tiered_get(
+def test_dax_backend_sync_close_waits_for_active_get(
     memory_allocator,
     loop_in_thread,
     monkeypatch,
@@ -1618,7 +1146,6 @@ def test_dax_backend_sync_close_waits_for_active_tiered_get(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
             },
         )
@@ -1698,280 +1225,39 @@ def test_dax_backend_sync_close_waits_for_active_tiered_get(
             backend.close()
 
 
-def test_dax_backend_primary_close_is_best_effort_with_borrowed_view(
-    disable_direct_gpu_ready,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        try:
-            key = CacheEngineKey("test_model", 1, 0, 413, torch.bfloat16)
-            obj = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert obj is not None
-            assert obj.tensor is not None
-            obj.tensor.fill_(8)
-            backend.batched_submit_put_task([key], [obj])
-            obj.ref_count_down()
-
-            borrowed = backend.get_blocking(key)
-            assert borrowed is not None
-            assert borrowed.tensor is not None
-            assert torch.all(borrowed.tensor == 8)
-
-            start = time.monotonic()
-            backend.close()
-            elapsed = time.monotonic() - start
-
-            assert elapsed < 0.5
-            assert torch.all(borrowed.tensor == 8)
-            borrowed.ref_count_down()
-        finally:
-            backend.close()
-
-
-def test_dax_backend_primary_close_is_best_effort_with_reserved_allocation(
-    disable_direct_gpu_ready,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        try:
-            obj = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert obj is not None
-            assert obj.tensor is not None
-            obj.tensor.fill_(8)
-
-            start = time.monotonic()
-            backend.close()
-            elapsed = time.monotonic() - start
-
-            assert elapsed < 0.5
-            assert torch.all(obj.tensor == 8)
-            obj.ref_count_down()
-        finally:
-            backend.close()
-
-
-def test_dax_backend_late_release_after_close_is_safe(
-    disable_direct_gpu_ready,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        try:
-            obj = backend.allocate(
-                torch.Size([2, 16, 8]),
-                torch.bfloat16,
-                fmt=MemoryFormat.KV_T2D,
-                eviction=False,
-            )
-            assert obj is not None
-            assert obj.tensor is not None
-            obj.tensor.fill_(8)
-
-            backend.close()
-
-            assert torch.all(obj.tensor == 8)
-            obj.ref_count_down()
-        finally:
-            backend.close()
-
-
-def test_dax_backend_primary_close_waits_for_inflight_allocate_but_not_release(
-    disable_direct_gpu_ready,
-    monkeypatch,
-) -> None:
-    del disable_direct_gpu_ready
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
-
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        backend = DaxBackend(
-            config=config,
-            metadata=metadata,
-            local_cpu_backend=None,
-            loop=None,
-            dst_device="cuda:0",
-        )
-
-        entered = threading.Event()
-        allow_finish = threading.Event()
-        close_returned = threading.Event()
-        result: dict[str, MemoryObj | None] = {}
-        errors: dict[str, BaseException] = {}
-        original = backend._set_memory_obj_handle
-
-        def _delayed_set(memory_obj, handle, lease) -> None:
-            entered.set()
-            assert allow_finish.wait(timeout=1)
-            original(memory_obj, handle, lease)
-
-        monkeypatch.setattr(backend, "_set_memory_obj_handle", _delayed_set)
-
-        def _allocate() -> None:
-            try:
-                result["obj"] = backend.allocate(
-                    torch.Size([2, 16, 8]),
-                    torch.bfloat16,
-                    fmt=MemoryFormat.KV_T2D,
-                    eviction=False,
-                )
-            except BaseException as e:
-                errors["allocate"] = e
-
-        allocator = threading.Thread(target=_allocate)
-        allocator.start()
-        assert entered.wait(timeout=1)
-
-        closer = threading.Thread(target=lambda: (backend.close(), close_returned.set()))
-        closer.start()
-        time.sleep(0.05)
-        assert not close_returned.is_set()
-
-        allow_finish.set()
-        allocator.join(timeout=1)
-        closer.join(timeout=1)
-
-        assert not allocator.is_alive()
-        assert not closer.is_alive()
-        assert "allocate" not in errors
-
-        obj = result["obj"]
-        assert obj is not None
-        assert close_returned.is_set()
-        assert obj.tensor is not None
-        obj.tensor.fill_(3)
-        assert torch.all(obj.tensor == 3)
-        obj.ref_count_down()
-
-
 def test_dax_backend_close_rejects_new_ops_after_shutdown(
-    disable_direct_gpu_ready,
 ) -> None:
-    del disable_direct_gpu_ready
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dax.bin")
         with open(dev_path, "wb") as fout:
-            fout.truncate(4096)
+            fout.truncate(16 * 1024 * 1024)
 
         config = _create_config(
             chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 4096 / 1024**3,
+                "dax.arena_size_gb": 16 / 1024,
             },
         )
         metadata = _create_metadata(chunk_size=16)
+        local_cpu = LocalCPUBackend(
+            config=config,
+            metadata=metadata,
+            dst_device="cpu",
+            memory_allocator=AdHocMemoryAllocator(device="cpu"),
+        )
         backend = DaxBackend(
             config=config,
             metadata=metadata,
-            local_cpu_backend=None,
+            local_cpu_backend=local_cpu,
             loop=None,
-            dst_device="cuda:0",
+            dst_device="cpu",
         )
 
         try:
             backend.close()
-            assert (
-                backend.allocate(
-                    torch.Size([2, 16, 8]),
-                    torch.bfloat16,
-                    fmt=MemoryFormat.KV_T2D,
-                    eviction=False,
-                )
-                is None
-            )
             assert backend.get_blocking(
                 CacheEngineKey("test_model", 1, 0, 999, torch.bfloat16)
             ) is None
@@ -2007,7 +1293,6 @@ def test_dax_backend_async_close_waits_for_active_put(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
                 "dax.async_put": True,
             },
@@ -2062,7 +1347,6 @@ def test_dax_backend_async_close_waits_for_put_completion(
             max_local_cpu_size=0.1,
             extra_config={
                 "dax.device_path": dev_path,
-                "dax.mode": "tiered",
                 "dax.arena_size_gb": 16 / 1024,
                 "dax.async_put": True,
             },
@@ -2102,83 +1386,3 @@ def test_dax_backend_async_close_waits_for_put_completion(
         finally:
             backend.close()
             releaser.join(timeout=1)
-
-
-def test_dax_backend_direct_init_failure_fail_fast(monkeypatch) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(8 * 1024 * 1024)
-
-        def _raise_cudart(*args, **kwargs):
-            del args, kwargs
-            raise RuntimeError("cudart not available")
-
-        monkeypatch.setattr(
-            "lmcache.v1.storage_backend.plugins.dax_backend.torch.cuda.cudart",
-            _raise_cudart,
-        )
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 8 / 1024,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-        with pytest.raises(RuntimeError, match="DAX direct GPU copy failed"):
-            DaxBackend(
-                config=config,
-                metadata=metadata,
-                local_cpu_backend=None,
-                loop=None,
-                dst_device="cuda:0",
-            )
-
-
-def test_dax_backend_direct_init_failure_releases_open_arena_resources(
-    monkeypatch,
-) -> None:
-    if not os.path.isdir("/proc/self/fd"):
-        pytest.skip("/proc/self/fd is not available on this platform")
-
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dax.bin")
-        with open(dev_path, "wb") as fout:
-            fout.truncate(8 * 1024 * 1024)
-
-        def _raise_cudart(*args, **kwargs):
-            del args, kwargs
-            raise RuntimeError("cudart not available")
-
-        monkeypatch.setattr(
-            "lmcache.v1.storage_backend.plugins.dax_backend.torch.cuda.cudart",
-            _raise_cudart,
-        )
-        config = _create_config(
-            chunk_size=16,
-            local_cpu=False,
-            max_local_cpu_size=0.0,
-            extra_config={
-                "dax.device_path": dev_path,
-                "dax.mode": "primary",
-                "dax.arena_size_gb": 8 / 1024,
-            },
-        )
-        metadata = _create_metadata(chunk_size=16)
-
-        fd_before = len(os.listdir("/proc/self/fd"))
-        for _ in range(3):
-            with pytest.raises(RuntimeError, match="DAX direct GPU copy failed"):
-                DaxBackend(
-                    config=config,
-                    metadata=metadata,
-                    local_cpu_backend=None,
-                    loop=None,
-                    dst_device="cuda:0",
-                )
-        fd_after = len(os.listdir("/proc/self/fd"))
-        assert fd_after == fd_before
