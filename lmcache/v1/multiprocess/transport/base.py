@@ -16,11 +16,10 @@ from lmcache.v1.common.custom_types import (
     PrepareStoreResponse,
     RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
+    RequestSnapshot,
 )
 from lmcache.v1.common.group_view import EngineGroupInfo
 from lmcache.v1.common.kv_format.types import LayoutHints
-from lmcache.v1.common.transfer_channel.api import TransferChannelAddress
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 from lmcache.v1.transport.futures import MessagingFuture, MessagingStream
 from lmcache.v1.transport.qstore import QRingInfo
@@ -216,6 +215,20 @@ class RequestClient(Protocol):
     ) -> MessagingFuture[None]: ...
 
     @rpc_method
+    def report_request_snapshot(
+        self, snapshot: RequestSnapshot
+    ) -> MessagingFuture[None]:
+        """Publish observed requests to the server's best-effort event bus.
+
+        Args:
+            snapshot: Immutable scheduler observations, including empty updates.
+
+        Returns:
+            A future for handler completion, not subscriber delivery.
+        """
+        ...
+
+    @rpc_method
     def noop(self) -> MessagingFuture[str]: ...
 
     @rpc_method
@@ -261,31 +274,6 @@ class RequestClient(Protocol):
     def cb_protocol_handshake(
         self, client_version: int
     ) -> MessagingFuture[tuple[int, bool]]: ...
-
-    @rpc_method
-    def p2p_lookup_and_lock(
-        self,
-        keys: list[ObjectKey],
-        group_layout_descs: dict[int, MemoryLayoutDesc],
-    ) -> MessagingFuture[int]: ...
-
-    @rpc_method
-    def p2p_query_lookup_results(
-        self, task_id: int
-    ) -> MessagingFuture[list[TransferChannelAddress] | None]: ...
-
-    @rpc_method
-    def p2p_unlock_objects(self, keys: list[ObjectKey]) -> MessagingFuture[None]: ...
-
-    @rpc_method
-    def p2p_reserve_write(
-        self, keys: list[ObjectKey], layout_desc: MemoryLayoutDesc
-    ) -> MessagingFuture[list[TransferChannelAddress]]: ...
-
-    @rpc_method
-    def p2p_finish_write(
-        self, keys: list[ObjectKey], succeeded: list[bool]
-    ) -> MessagingFuture[list[bool]]: ...
 
     @rpc_method
     def get_experimental(self) -> MessagingFuture[list[str]]: ...
