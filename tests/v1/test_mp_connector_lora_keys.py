@@ -42,8 +42,6 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
 )
 from lmcache.integration.vllm.utils import LORA_TAG_KEY  # noqa: E402
 
-pytestmark = pytest.mark.no_shared_allocator
-
 ADAPTER_A = LoRARequest("adapter-a", 1, "/adapters/a")
 ADAPTER_B = LoRARequest("adapter-b", 2, "/adapters/b")
 
@@ -186,6 +184,7 @@ def test_eager_lookup_carries_the_lora_tag():
     connector = SimpleNamespace(
         role=KVConnectorRole.SCHEDULER,
         _eager_prefetch=True,
+        _request_snapshot_enabled=False,
         _reserve_last_token_for_lookup=False,
         _save_unfull_chunk=False,
         scheduler_adapter=scheduler_adapter,
